@@ -35,14 +35,6 @@
 #include <typeinfo>
 
 
-#ifndef USE_READLINE
-#define USE_READLINE
-#endif
-
-#ifndef USE_LESS
-#define USE_LESS
-#endif
-
 #ifdef USE_READLINE
 #include <readline/readline.h>
 #include <readline/history.h>
@@ -153,7 +145,6 @@ char *cmd_generator(const char *text, int state)
     return NULL;
 }
 
-
 char **str_name_completion(const char *text, int start, int end)
 {
     rl_attempted_completion_over = 1;
@@ -168,67 +159,77 @@ char **str_name_completion(const char *text, int start, int end)
 
 namespace souffle {
 
-/* 
- * 2 types of constraints
- * 1. two varaible are the same value, have to be pair<<size_t, size_t>, <size_t, size_t>> which represented bounded variables
- * 2. certain field must be some value which represented by <<size_t, size_t>, <size_t, ramdomain>> <tuple idx, array idx>, <bool for str or number, ramdomain>
- *
- */
-struct tuple_info {
-    Relation* r;
-    RamDomain num;
-};
-
-class QueryTuple {
-public:
-    QueryTuple(Relation* r) : rel(r), iter(rel->begin()), end(rel->end()) {}
-    ~QueryTuple() = default;
-    Relation* rel;
-    Relation::iterator iter;
-    Relation::iterator end;
-};
-/*
-class QueryProductIterator {
-public:
-    QueryProductIterator() 
-private:
-    std::vector< >    
-}
-*/
-
-class QueryProduct;
-
-class QueryProduct {
-public:
-    // use query queryTuples to build the product
-    QueryProduct(std::vector<std::pair<std::string, std::vector<std::string> > > queryTuples) {
-        
-    }
-    class QueryProductIterator {
-    public:
-
-        QueryProductIterator(QueryProduct qp) {
-            
-        }
-
-    private:
-
-    };
-    QueryProductIterator begin() const {}
-    QueryProductIterator end() const {}
-
-private:
-
-};
+/* Equivalence class for variables in query command */
 class Equivalence {
 public:
-    Equivalence() = default;
+    ~Equivalence() = default;
+    Equivalence(char t, std::string s, std::pair<size_t, size_t> idx) : type(t), symbol(s) {
+        indices.push_back(idx);
+    }
     
+    Equivalence(const Equivalence& o) = default;
+    Equivalence& operator=(const Equivalence& o) = default;
+    void push_back(std::pair<size_t, size_t> idx) {
+        indices.push_back(idx);
+    }
+
+    // verify if elements at the indices are equivalent in the given product
+    bool verify(const std::vector<tuple>& product) const {
+        for (size_t i = 1; i < indices.size(); ++i) {
+            if (product[indices[i].first][indices[i].second] != product[indices[i-1].first][indices[i-1].second]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // get the index of first element in the indices array
+    std::pair<size_t, size_t> getFirstIdx() {
+        return indices[0];
+    }
+
+    std::vector<std::pair<size_t, size_t>> getIndices() {
+        return indices;
+    }
+
+    char getType() {
+        return type;
+    }
+    
+    std::string getSymbol() {
+        return symbol;
+    }
+
 private:
-    std::set<RamDomain> eq; 
+    char type;
+    std::string symbol;
+    std::vector<std::pair<size_t, size_t>> indices; 
 
 };
 
+/* const constraints for values in query command */
+class ConstConstr {
+public:
+    ConstConstr() = default;
+    ~ConstConstr() = default;
+    void push_back(std::pair<std::pair<size_t, size_t>, RamDomain> constr) {
+        constConstrs.push_back(constr);
+    }
+    bool verify(const std::vector<tuple>& product) const {
+        for (auto constr : constConstrs) {
+            if (product[constr.first.first][constr.first.second] != constr.second) {
+                return false;
+            }
+        }
+        return true;
+    }
+    std::vector<std::pair<std::pair<size_t, size_t>, RamDomain>>& getConstrs() {
+        return constConstrs;
+    }
+
+private:
+    std::vector<std::pair<std::pair<size_t, size_t>, RamDomain>> constConstrs;
+};
 
 class ExplainConfig {
 public:
@@ -393,126 +394,221 @@ public:
             printPrompt("Exiting explain\n");
             return false;
         } else if (command[0] == "query") {
-            /*
-             * NOTE: current query command cannot have space/tabs within the relation tuples
-             * e.g. edge(1, 2) or edge(1 , 2) or edge(1 ,2) will give the wrong result, Only edge(1,2) works
-             * */
             // if there is no given relations, return directly
             if (command.size() != 2) {
-                printError("Usage: query relation_name_1(\"<string element1>\",<number element2>, ...) "
-                           "relation_name_2(\"<string element1>\",<number element2>, ...) ...\n");
+                printError("Usage: query relation_name_1(\"<string element1>\", <number element2>, ...), "
+                           "relation_name_2(\"<string element1>\", <number element2>, ...), ...\n");
             }
-            auto query = split(command[1], ' ');
+            // vector rels stores command, args pair parsed by parseQueryTuple()
             std::vector<std::pair<std::string, std::vector<std::string>>> rels;
-            for (auto q : query) {
-                rels.push_back(parseQueryTuple(q));
-            }
             std::regex varRegex("[a-zA-Z_][a-zA-Z_0-9]*", std::regex_constants::extended);
             std::regex symbolRegex("\"([^\"]*)\"", std::regex_constants::extended);
             std::regex numberRegex("[0-9]+", std::regex_constants::extended);
-            std::smatch argsMatching;
-            // constraint 1 is for same varible must have same value
-            std::vector<std::pair<std::pair<size_t, size_t>, std::pair<size_t, size_t>>> constr1;
-            // constraint 2 is for idx must equals to certain value
-            std::vector<std::pair<std::pair<size_t, size_t>, RamDomain>> constr2;
-            // map for variable and its first appearence idx
-            std::map<std::string, std::pair<size_t, size_t>> varMap;
-            // vector of iterators
-            std::vector<QueryTuple> its;
-            for (size_t i = 0; i < rels.size(); i++) {
-                QueryTuple qt(prov.getSouffleProgram().getRelation(rels[i].first));
-                its.push_back(qt);
-                size_t contain_var = 0;
-                for (int j = 0; j < rels[i].second.size(); j++) {
-                    if (std::regex_match(rels[i].second[j], argsMatching, varRegex)) {
-                        auto varIdx =  varMap.find(argsMatching[0]);
-                        contain_var = 1;
-                        if (varIdx == varMap.end()) {
-                            varMap.insert({argsMatching[0], std::make_pair(i, j)});
+            std::regex relRegex(
+                    "([a-zA-Z0-9_.-]*)[[:blank:]]*\\(([[:blank:]]*([0-9]+|\"[^\"]*\"|[a-zA-Z_][a-zA-Z_0-9]*)([[:blank:]]*,[[:blank:]]*(["
+                    "0-"
+                    "9]+|\"[^\"]*\"|[a-zA-Z_][a-zA-Z_0-9]*))*)?\\)",
+                    std::regex_constants::extended);
+            std::smatch relMatcher;
+            std::smatch argsMatcher;
+            std::string relStr = command[1];
+            // split the relations in the relation product string
+            while (std::regex_search(relStr, relMatcher, relRegex)) {
+                rels.push_back(parseQueryTuple(relMatcher[0]));
+                if (rels.back().first.size() == 0 || rels.back().second.size() == 0) {
+                    printError("Usage: query relation_name_1(\"<string element1>\", <number element2>, ...), "
+                               "relation_name_2(\"<string element1>\", <number element2>, ...), ...\n");
+                    return true;
+                }
+                relStr = relMatcher.suffix().str();
+            }
+            if (rels.size() == 0) {
+                printError("Usage: query relation_name_1(\"<string element1>\", <number element2>, ...), "
+                           "relation_name_2(\"<string element1>\", <number element2>, ...), ...\n");
+                return true;
+            }
+            // map for variable name and corresponding equivalence class
+            std::map<std::string, Equivalence> varMap;
+            // const constraints that solution tuple must satisfy
+            ConstConstr cc;
+            // qpRels stores relation of tuples that contains at least one variable
+            std::vector<Relation*> qpRels;
+            // counter for adding element to qpRels
+            size_t idx = 0;
+            for (size_t i = 0; i < rels.size(); ++i) {
+                Relation* r = prov.getSouffleProgram().getRelation(rels[i].first);
+                std::vector<RamDomain> constTuple;
+                if (r == nullptr) {
+                    printError("Relation <" + rels[i].first + "> does not exist\n");
+                    printError("Usage: query relation_name_1(\"<string element1>\", <number element2>, ...), "
+                               "relation_name_2(\"<string element1>\", <number element2>, ...), ...\n");
+                    return true;
+                }
+                if (r->getArity() - 2 != rels[i].second.size()) {
+                    std::cout << "<" << rels[i].first << "> has arity of " << (r->getArity() - 2) << std::endl;
+                    printError("Usage: query relation_name_1(\"<string element1>\", <number element2>, ...), "
+                               "relation_name_2(\"<string element1>\", <number element2>, ...), ...\n");
+                    return true;
+                }
+                bool containVar = false;
+                for (size_t j = 0; j < rels[i].second.size(); ++j) {
+                    if (std::regex_match(rels[i].second[j], argsMatcher, varRegex)) {
+                        containVar = true;
+                        auto mapIt =  varMap.find(argsMatcher[0]);
+                        if (mapIt == varMap.end()) {
+                            varMap.insert({argsMatcher[0], Equivalence(*(r->getAttrType(j)), argsMatcher[0], std::make_pair(idx, j))});
                         } else {
-                            constr1.push_back(std::make_pair(varIdx->second, std::make_pair(i, j)));
+                            mapIt->second.push_back(std::make_pair(idx, j));
                         }
-                    } else if (std::regex_match(rels[i].second[j], argsMatching, symbolRegex)) {
-                        RamDomain rd = prov.getSouffleProgram().getSymbolTable().lookup(argsMatching[1]);
-                        constr2.push_back(std::make_pair(std::make_pair(i, j), rd));
-                    } else if (std::regex_match(rels[i].second[j], argsMatching, numberRegex)) {
-                        RamDomain rd = std::stoi(argsMatching[0]);
-                        constr2.push_back(std::make_pair(std::make_pair(i, j), rd));
-                    }
-                }
-                // if tuple does not contain any variable , then check if tuple exists
-            }
-            std::cout << "bounded variable" << std::endl;
-            for (auto c : constr1) {
-                std::cout << c.first.first << " " << c.first.second << " " << c.second.first << " " << c.second.second << std::endl;
-            }
-            std::cout << "constant value" << std::endl;
-            for (auto c : constr2) {
-                std:: cout << c.first.first << " " << c.first.second << " " << c.second << std::endl;
-            }
-            std::cout << "end constraints" << std::endl;
-            size_t solu_c = 0;
-            for (auto v : varMap) {
-                std::cout << v.first << "    ";
-            }
-            std::cout << std::endl;
-            while (1) {
-                size_t cont = 1;
-                size_t terminate = 1; 
-                for (auto it : its) {
-                    for (size_t i = 0; i < (*(it.iter)).size(); ++i) {
-                        //std::cout << (*(it.iter))[i] << " ";
-                    }
-                    //std::cout << std::endl;
-                }
-                // check constr 1
-                for (auto constr : constr1) {
-                    if ((*(its[constr.first.first].iter))[constr.first.second] != (*(its[constr.second.first].iter))[constr.second.second]) {
-                        cont = 0;
-                        break;
+                    } else if (std::regex_match(rels[i].second[j], argsMatcher, symbolRegex)) {
+                        if (*(r->getAttrType(j)) != 's') {
+                            std::cout << argsMatcher[0] << " is not a symbol" << std::endl;
+                            printError("Usage: query relation_name_1(\"<string element1>\", <number element2>, ...), "
+                                           "relation_name_2(\"<string element1>\", <number element2>, ...), ...\n");
+                            return true;
+                        }
+                        RamDomain rd = prov.getSouffleProgram().getSymbolTable().lookup(argsMatcher[1]);
+                        cc.push_back(std::make_pair(std::make_pair(idx, j), rd));
+                        if (!containVar) {
+                            constTuple.push_back(rd);
+                        }
+                    } else if (std::regex_match(rels[i].second[j], argsMatcher, numberRegex)) {
+                        if (*(r->getAttrType(j)) != 'i') {
+                            std::cout << argsMatcher[0] << " is not a number" << std::endl;
+                            printError("Usage: query relation_name_1(\"<string element1>\", <number element2>, ...), "
+                                           "relation_name_2(\"<string element1>\", <number element2>, ...), ...\n");
+                            return true;
+                        }
+                        RamDomain rd = std::stoi(argsMatcher[0]);
+                        cc.push_back(std::make_pair(std::make_pair(idx, j), rd));
+                        if (!containVar) {
+                            constTuple.push_back(rd);
+                        }
                     }
                 }
                 
-                // if constr 1 are all satisfied, check constr 2
-                if (cont) {
-                    for (auto constr : constr2) {
-                        if ((*(its[constr.first.first].iter))[constr.first.second] != constr.second) {
-                            cont = 0;
+                // if tuple does not contain any variable, check if relation contains this tuple
+                if (!containVar) {
+                    bool containTuple = false;
+                    for (auto it = r->begin(); it != r->end(); ++it) {
+                        bool eq = true;
+                        for (size_t j = 0; j < constTuple.size(); ++j) {
+                            if (constTuple[j] != (*it)[j]) {
+                                eq = false;
+                                break;
+                            }
+                        }
+                        if (eq) {
+                            containTuple = true;
                             break;
                         }
                     }
-                }
-                if (cont && varMap.size() > 0) {
-                    solu_c++;
-                }
-                
-                if (cont && varMap.size() != 0) {
-                    for (auto v : varMap) {
-                        std::cout << (*(its[v.second.first].iter))[v.second.second] << "    ";
+                    // if relation contains this tuple, remove all related constraints
+                    if (containTuple) {
+                        cc.getConstrs().erase(cc.getConstrs().end() - r->getArity() + 2, cc.getConstrs().end());
+                        
+                    } else { // otherwise, there will there is no solution for given query
+                        std::cout << "No solution for given query" << std::endl;
+                        return true;
                     }
-                    std::cout << std::endl;
+                } else {
+                    qpRels.push_back(r);
+                    ++idx;
                 }
-
-                // change the iterators
-                for (auto it = its.rbegin(); it != its.rend(); ++it) {
-                    if ((++((*it).iter)) != (*it).rel->end()) {
-                        terminate =  0;
+            }
+            
+            std::vector<Relation::iterator> qpIt;
+            std::vector<std::vector<RamDomain>> solutions;
+            for (auto r : qpRels) {
+                qpIt.push_back(r->begin());
+            }
+            size_t slot_width = 8;
+            while (true) {
+                bool isSolution = true;
+                // the vector that contains the tuples the iterators currently points to
+                std::vector<tuple> element;
+                for (auto it : qpIt) {
+                   element.push_back(*it);
+                }
+                // check if the tuples satisifies variable equivalence
+                for (auto var : varMap) {
+                    if (!var.second.verify(element)) {
+                        isSolution = false;
+                        break;
+                    }
+                }
+                if (isSolution) {
+                    // check if tuple satisifies const constraints
+                    isSolution = cc.verify(element);
+                }
+                if (isSolution) {
+                    std::vector<RamDomain> solution;
+                    for (auto var : varMap) {
+                        auto idx = var.second.getFirstIdx();
+                        solution.push_back(element[idx.first][idx.second]);
+                        // check the number of the solution
+                        size_t solution_width;
+                        if (var.second.getType() == 's') {
+                            solution_width = prov.getSouffleProgram().getSymbolTable().resolve(element[idx.first][idx.second]).length();
+                        } else {
+                            solution_width = std::to_string(element[idx.first][idx.second]).length();
+                        }
+                        if (solution_width > slot_width) {
+                            slot_width = solution_width;
+                        }
+                    }
+                    solutions.push_back(solution);
+                }
+                // increment the iterators
+                size_t i = qpRels.size() - 1;
+                bool terminate = true;
+                for (auto it = qpIt.rbegin(); it != qpIt.rend(); ++it) {
+                    if ((++(*it)) != qpRels[i]->end()) {
+                        terminate = false;
                         break;
                     } else {
-                        (*it).iter = (*it).rel->begin();
+                        (*it) = qpRels[i]->begin();
+                        --i;
                     }
                 }
-
-                // check if terminate
                 if (terminate) {
                     break;
                 }
-                
+            }
+            for (auto var : varMap) {
+                if (var.first.length() > slot_width) {
+                    slot_width = var.first.length();
+                }
             }
 
-        }
-        
-        else {
+            std::string line((slot_width + 1) * varMap.size() + 1, '-');
+            std::cout << line << std::endl;
+            std::cout << "|";
+            for (auto var : varMap) {
+                std::string s(slot_width, ' ');
+                s.replace(0, var.first.length(), var.first);
+                std::cout << s << "|";
+            }
+            std::cout << std::endl;
+            std::cout << line << std::endl;
+            for (size_t i = 0; i < solutions.size(); ++i) {
+               size_t j = 0;
+               std::cout << "|";
+               for (auto var : varMap) {
+                   std::string solu(slot_width, ' ');
+                   if (var.second.getType() == 'i') {
+                       solu.replace(0, std::to_string(solutions[i][j]).length(), std::to_string(solutions[i][j]));
+                       std::cout << solu << "|";
+                   } else {
+                       solu.replace(0, prov.getSouffleProgram().getSymbolTable().resolve(solutions[i][j]).length(), prov.getSouffleProgram().getSymbolTable().resolve(solutions[i][j]));
+                       std::cout << solu << "|";
+                   }
+                   ++j;
+               }
+               std::cout << std::endl;
+               std::cout << line << std::endl;
+            }
+        } else {
             printError(
                     "\n----------\n"
                     "Commands:\n"
@@ -602,7 +698,6 @@ private:
     std::pair<std::string, std::vector<std::string>> parseQueryTuple(const std::string& str) {
         std::string relName;
         std::vector<std::string> args;
-        std::cout << str << std::endl;
         // regex for matching tuples
         // values matches numbers or strings enclosed in quotation marks
         std::regex relRegex(
@@ -738,7 +833,6 @@ private:
             *output << "}\n";
         }
     }
-
     /* Print any other information, disabled for non-terminal outputs */
     void printInfo(const std::string& info) override {
         if (!isatty(fileno(stdin))) {
